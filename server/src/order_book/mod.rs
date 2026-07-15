@@ -60,7 +60,8 @@ impl<O: InnerOrder> OrderBook<O> {
     }
 
     pub(crate) fn add_order(&mut self, order: O) {
-        let _inserted = self.add_order_before(order, None);
+        let inserted = self.add_order_before(order, None);
+        debug_assert!(inserted);
     }
 
     // Rests the order directly in front of `insert_before` at its price level (at the back when

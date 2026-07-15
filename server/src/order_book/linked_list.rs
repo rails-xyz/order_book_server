@@ -65,15 +65,12 @@ impl<K: Clone + Eq + Hash, T: Clone> LinkedList<K, T> {
         let Some(&before_sid) = self.key_to_sid.get(before) else {
             return false;
         };
-        let node = Node::new(key.clone(), value);
+        let mut node = Node::new(key.clone(), value);
+        let prev = self.slab[before_sid].prev;
+        node.prev = prev;
+        node.next = Some(before_sid);
         let sid = self.slab.insert(node);
         self.key_to_sid.insert(key, sid);
-        let prev = self.slab[before_sid].prev;
-        {
-            let new_node = &mut self.slab[sid];
-            new_node.prev = prev;
-            new_node.next = Some(before_sid);
-        }
         self.slab[before_sid].prev = Some(sid);
         match prev {
             Some(p) => self.slab[p].next = Some(sid),
