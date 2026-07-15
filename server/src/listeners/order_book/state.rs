@@ -95,7 +95,7 @@ impl OrderBookState {
             }
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
-                InnerOrderDiff::New { sz } => {
+                InnerOrderDiff::New { sz, insert_before } => {
                     if let Some(order) = order_map.remove(&oid) {
                         let time = order.time.and_utc().timestamp_millis();
                         let mut inner_order: InnerL4Order = order.try_into()?;
@@ -103,7 +103,9 @@ impl OrderBookState {
                         // must replace time with time of entering book, which is the timestamp of the order status update
                         #[allow(clippy::unwrap_used)]
                         inner_order.convert_trigger(time.try_into().unwrap());
-                        self.order_book.add_order(inner_order);
+                        if !self.order_book.add_order_before(inner_order, insert_before) {
+                            return Err(format!("Unable to find insertBefore order on the book {diff:?}").into());
+                        }
                     } else {
                         return Err(format!("Unable to find order opening status {diff:?}").into());
                     }
