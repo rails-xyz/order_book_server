@@ -59,7 +59,15 @@ impl<O: InnerOrder> OrderBook<O> {
         Self { oid_to_side_px: HashMap::new(), bids: BTreeMap::new(), asks: BTreeMap::new() }
     }
 
-    pub(crate) fn add_order(&mut self, mut order: O) {
+    pub(crate) fn add_order(&mut self, order: O) {
+        let inserted = self.add_order_before(order, None);
+        debug_assert!(inserted);
+    }
+
+    // Rests the order directly in front of `insert_before` at its price level (at the back when
+    // None), as dictated by the node's book diff. Returns false when `insert_before` is not
+    // resting at that level, which means the book has diverged from the stream.
+    pub(crate) fn add_order_before(&mut self, mut order: O, insert_before: Option<Oid>) -> bool {
         let (maker_orders, resting_book) = match order.side() {
             Side::Ask => (&mut self.bids, &mut self.asks),
             Side::Bid => (&mut self.asks, &mut self.bids),
@@ -69,9 +77,13 @@ impl<O: InnerOrder> OrderBook<O> {
             self.oid_to_side_px.remove(&oid);
         }
         if order.sz().is_positive() {
-            self.oid_to_side_px.insert(order.oid(), (order.side(), order.limit_px()));
-            add_order_to_book(resting_book, order);
+            let (oid, side, px) = (order.oid(), order.side(), order.limit_px());
+            if !add_order_to_book(resting_book, order, insert_before) {
+                return false;
+            }
+            self.oid_to_side_px.insert(oid, (side, px));
         }
+        true
     }
 
     pub(crate) fn cancel_order(&mut self, oid: Oid) -> bool {
@@ -133,10 +145,27 @@ impl<O: InnerOrder> OrderBook<O> {
     }
 }
 
-fn add_order_to_book<O: InnerOrder>(map: &mut BTreeMap<Px, LinkedList<Oid, O>>, order: O) {
+fn add_order_to_book<O: InnerOrder>(
+    map: &mut BTreeMap<Px, LinkedList<Oid, O>>,
+    order: O,
+    insert_before: Option<Oid>,
+) -> bool {
     let oid = order.oid();
     let limit_px = order.limit_px();
-    map.entry(limit_px).or_insert_with(|| LinkedList::new()).push_back(oid, order);
+    let list = map.entry(limit_px).or_insert_with(|| LinkedList::new());
+    match insert_before {
+        None => {
+            list.push_back(oid, order);
+            true
+        }
+        Some(before) => {
+            let inserted = list.insert_before(&before, oid, order);
+            if list.is_empty() {
+                map.remove(&limit_px);
+            }
+            inserted
+        }
+    }
 }
 
 fn match_order<O: InnerOrder>(maker_orders: &mut BTreeMap<Px, LinkedList<Oid, O>>, taker_order: &mut O) -> Vec<Oid> {
@@ -304,6 +333,63 @@ mod tests {
         asks[0].sz = 450;
 
         assert_same_book(Snapshot([bids.clone(), asks.clone()]), book.to_snapshot());
+    }
+
+    #[test]
+    fn insert_before_book_test() {
+        let mut factory = OrderFactory::default();
+        let mut book = OrderBook::new();
+        // oids 0..=2 rest at the same level in arrival order
+        let orders = factory.batch_order(100, 5, Side::Bid, 3);
+        for order in orders.clone() {
+            book.add_order(order);
+        }
+
+        // A priority order jumps to the front of the level
+        let front = factory.order(100, 5, Side::Bid);
+        assert!(book.add_order_before(front.clone(), Some(Oid::new(0))));
+        // Another lands in the middle
+        let middle = factory.order(100, 5, Side::Bid);
+        assert!(book.add_order_before(middle.clone(), Some(Oid::new(1))));
+        let expected = vec![front, orders[0].clone(), middle.clone(), orders[1].clone(), orders[2].clone()];
+        assert_eq!(book.to_snapshot().as_ref()[0], expected);
+
+        // Unknown anchor oid fails and leaves the book unchanged
+        assert!(!book.add_order_before(factory.order(100, 5, Side::Bid), Some(Oid::new(99))));
+        // Anchor resting at a different price level fails as well
+        let other_level = factory.order(100, 4, Side::Bid);
+        let other_oid = other_level.oid();
+        book.add_order(other_level.clone());
+        assert!(!book.add_order_before(factory.order(100, 5, Side::Bid), Some(other_oid.clone())));
+        assert_eq!(book.to_snapshot().as_ref()[0], [expected, vec![other_level]].concat());
+
+        // The jumped-to-front order is the first maker filled; oid 0 is filled partially
+        book.add_order(factory.order(150, 5, Side::Ask));
+        let snapshot = book.to_snapshot();
+        let bids = &snapshot.as_ref()[0];
+        assert_eq!(bids[0].oid(), orders[0].oid());
+        assert_eq!(bids[0].sz, 50);
+
+        // Canceling around an inserted order keeps the level consistent
+        assert!(book.cancel_order(middle.oid()));
+        assert!(book.cancel_order(orders[0].oid()));
+        let bids = book.to_snapshot().as_ref()[0].iter().map(InnerOrder::oid).collect_vec();
+        assert_eq!(bids, vec![orders[1].oid(), orders[2].oid(), other_oid]);
+    }
+
+    #[test]
+    fn insert_before_empty_level_test() {
+        let mut factory = OrderFactory::default();
+        let mut book = OrderBook::new();
+        let resting = factory.order(100, 5, Side::Bid);
+        book.add_order(resting.clone());
+        // A failed insert at a fresh price level must not leave an empty level behind
+        assert!(!book.add_order_before(factory.order(100, 6, Side::Bid), Some(Oid::new(42))));
+        let snapshot = book.to_snapshot();
+        assert_eq!(snapshot.as_ref()[0], vec![resting]);
+        // The empty level would otherwise produce a phantom L2 level
+        let l2 = book.to_l2_snapshot(None, None, None);
+        assert_eq!(l2.as_ref()[0].len(), 1);
     }
 
     fn assert_same_book(s1: Snapshot<MinimalOrder>, s2: Snapshot<MinimalOrder>) {
