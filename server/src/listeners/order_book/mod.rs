@@ -248,10 +248,19 @@ pub(crate) struct OrderBookListener {
     // Only Some when we want it to collect updates
     fetched_snapshot_cache: Option<VecDeque<(Batch<NodeDataOrderStatus>, Batch<NodeDataOrderDiff>)>>,
     internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+    // At most one l2 snapshot broadcast per this interval (zero = every block,
+    // the upstream behavior). Throttling is lossless: snapshots are full
+    // frames, so the next broadcast carries everything the dropped ones did.
+    l2_broadcast_min_interval: Duration,
+    last_l2_broadcast: Option<Instant>,
 }
 
 impl OrderBookListener {
-    pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(
+        internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
+        ignore_spot: bool,
+        l2_broadcast_min_interval: Duration,
+    ) -> Self {
         Self {
             ignore_spot,
             fill_status_file: None,
@@ -264,6 +273,8 @@ impl OrderBookListener {
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
             order_status_cache: BatchQueue::new(),
+            l2_broadcast_min_interval,
+            last_l2_broadcast: None,
         }
     }
 
@@ -511,14 +522,22 @@ impl DirectoryListener for OrderBookListener {
                 return Err(err);
             }
         }
-        let snapshot = self.l2_snapshots(true);
-        if let Some(snapshot) = snapshot {
-            if let Some(tx) = &self.internal_message_tx {
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
-                    let _unused = tx.send(snapshot);
-                });
+        // Gating BEFORE l2_snapshots also skips building the all-coins
+        // snapshot map, so CPU falls with the frame rate. Skipped blocks lose
+        // nothing (see the field comment); worst-case subscriber staleness is
+        // one interval, because new blocks (~75ms apart) re-enter this path.
+        // Subscribe-time snapshots (l2_snapshots_now) bypass this throttle.
+        if self.last_l2_broadcast.is_none_or(|last| last.elapsed() >= self.l2_broadcast_min_interval) {
+            let snapshot = self.l2_snapshots(true);
+            if let Some(snapshot) = snapshot {
+                if let Some(tx) = &self.internal_message_tx {
+                    self.last_l2_broadcast = Some(Instant::now());
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                        let _unused = tx.send(snapshot);
+                    });
+                }
             }
         }
         Ok(())

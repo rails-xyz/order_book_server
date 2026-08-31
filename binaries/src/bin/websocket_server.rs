@@ -33,6 +33,13 @@ struct Args {
     /// Seeding always retries every 10s until the first snapshot succeeds.
     #[arg(long, default_value_t = 10)]
     snapshot_validation_interval_secs: u64,
+
+    /// Minimum milliseconds between l2Book broadcasts (0 = one per block).
+    /// Lossless coalescing: every broadcast is a full frame, so subscribers
+    /// are never more than one interval behind the book. Subscribe-time
+    /// snapshots and the trades stream are not throttled.
+    #[arg(long, default_value_t = 0)]
+    l2_broadcast_min_interval_ms: u64,
 }
 
 #[tokio::main]
@@ -60,6 +67,7 @@ async fn main() -> Result<()> {
         true,
         compression_level,
         Duration::from_secs(args.snapshot_validation_interval_secs),
+        Duration::from_millis(args.l2_broadcast_min_interval_ms),
     )
     .await?;
 

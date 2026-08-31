@@ -34,6 +34,7 @@ pub async fn run_websocket_server(
     ignore_spot: bool,
     compression_level: u32,
     snapshot_validation_interval: std::time::Duration,
+    l2_broadcast_min_interval: std::time::Duration,
 ) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
 
@@ -41,7 +42,7 @@ pub async fn run_websocket_server(
     let home_dir = home_dir().ok_or("Could not find home directory")?;
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
-        OrderBookListener::new(Some(internal_message_tx), ignore_spot)
+        OrderBookListener::new(Some(internal_message_tx), ignore_spot, l2_broadcast_min_interval)
     };
     let listener = Arc::new(Mutex::new(listener));
     {
