@@ -2,11 +2,14 @@ use crate::{
     listeners::order_book::{
         InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
     },
-    order_book::{Coin, Snapshot},
+    order_book::Coin,
     prelude::*,
+    servers::{
+        mqtt_publisher::{MqttConfig, MqttPems, run_mqtt_publisher},
+        payloads,
+    },
     types::{
-        L2Book, L4Book, L4BookUpdates, L4Order, Trade,
-        inner::InnerLevel,
+        L4Book, L4BookUpdates, L4Order, Trade,
         node_data::{Batch, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
     },
@@ -35,6 +38,7 @@ pub async fn run_websocket_server(
     compression_level: u32,
     snapshot_validation_interval: std::time::Duration,
     l2_broadcast_min_interval: std::time::Duration,
+    mqtt_config: Option<MqttConfig>,
 ) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
 
@@ -52,6 +56,18 @@ pub async fn run_websocket_server(
                 error!("Listener fatal error: {err}");
                 std::process::exit(1);
             }
+        });
+    }
+
+    if let Some(mqtt_config) = mqtt_config {
+        // PEMs are validated before spawning: a bad path is a deploy error
+        // and should fail startup, while everything after this point only
+        // warns — MQTT must never take the WS server down.
+        let pems = MqttPems::load(&mqtt_config)?;
+        let internal_message_rx = internal_message_tx.subscribe();
+        let listener = listener.clone();
+        tokio::spawn(async move {
+            run_mqtt_publisher(mqtt_config, pems, internal_message_rx, listener).await;
         });
     }
 
@@ -125,7 +141,7 @@ async fn handle_socket(
                             InternalMessage::Snapshot{ l2_snapshots, time } => {
                                 universe = new_universe(l2_snapshots, ignore_spot);
                                 for sub in manager.subscriptions() {
-                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time).await;
+                                    send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots, *time).await;
                                 }
                             },
                             InternalMessage::Trades{ trades } => {
@@ -262,19 +278,13 @@ fn new_universe(l2_snapshots: &L2Snapshots, ignore_spot: bool) -> HashSet<String
 async fn send_ws_data_from_snapshot(
     socket: &mut WebSocket,
     subscription: &Subscription,
-    snapshot: &HashMap<Coin, HashMap<L2SnapshotParams, Snapshot<InnerLevel>>>,
+    l2_snapshots: &L2Snapshots,
     time: u64,
 ) {
     if let Subscription::L2Book { coin, n_sig_figs, n_levels, mantissa } = subscription {
-        let snapshot = snapshot.get(&Coin::new(coin));
-        if let Some(snapshot) =
-            snapshot.and_then(|snapshot| snapshot.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
-        {
-            let n_levels = n_levels.unwrap_or(DEFAULT_LEVELS);
-            let snapshot = snapshot.truncate(n_levels);
-            let snapshot = snapshot.export_inner_snapshot();
-            let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot, time);
-            let msg = ServerResponse::L2Book(l2_book);
+        let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
+        let n_levels = n_levels.unwrap_or(DEFAULT_LEVELS);
+        if let Some(msg) = payloads::l2_book_response(l2_snapshots, coin, &params, n_levels, time) {
             send_socket_message(socket, msg).await;
         } else {
             error!("Coin {coin} not found");
@@ -338,16 +348,12 @@ impl Subscription {
         if let Self::L2Book { coin, n_sig_figs, n_levels, mantissa } = self {
             // Without this a reconnecting client shows a stale book until the
             // next block-driven frame arrives.
-            let snapshot = listener.lock().await.l2_snapshots_now().and_then(|(time, snapshots)| {
-                snapshots
-                    .as_ref()
-                    .get(&Coin::new(coin))
-                    .and_then(|entries| entries.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
-                    .map(|snapshot| (time, snapshot.truncate(n_levels.unwrap_or(DEFAULT_LEVELS))))
+            let params = L2SnapshotParams::new(*n_sig_figs, *mantissa);
+            let msg = listener.lock().await.l2_snapshots_now().and_then(|(time, snapshots)| {
+                payloads::l2_book_response(&snapshots, coin, &params, n_levels.unwrap_or(DEFAULT_LEVELS), time)
             });
-            if let Some((time, snapshot)) = snapshot {
-                let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot.export_inner_snapshot(), time);
-                return Ok(Some(ServerResponse::L2Book(l2_book)));
+            if let Some(msg) = msg {
+                return Ok(Some(msg));
             }
             return Err("Snapshot Failed".into());
         }

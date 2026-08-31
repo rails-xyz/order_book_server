@@ -202,7 +202,7 @@ fn fetch_snapshot(
 
 // Matches the rough depth of the public HL WS trades snapshot; the UI panel
 // shows far fewer.
-const RECENT_TRADES_CAP: usize = 100;
+pub(crate) const RECENT_TRADES_CAP: usize = 100;
 
 // Trades are assembled once here rather than per connection: every fills batch
 // fans out to all subscribers, and the recent-trades buffer needs them anyway.
@@ -534,7 +534,8 @@ impl DirectoryListener for OrderBookListener {
                     self.last_l2_broadcast = Some(Instant::now());
                     let tx = tx.clone();
                     tokio::spawn(async move {
-                        let snapshot = Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
+                        let snapshot =
+                            Arc::new(InternalMessage::Snapshot { l2_snapshots: snapshot.1, time: snapshot.0 });
                         let _unused = tx.send(snapshot);
                     });
                 }

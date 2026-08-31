@@ -3,7 +3,7 @@ use log::info;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-const MAX_LEVELS: usize = 100;
+pub(crate) const MAX_LEVELS: usize = 100;
 pub(crate) const DEFAULT_LEVELS: usize = 20;
 
 #[derive(Debug, Serialize, Deserialize)]
