@@ -2,18 +2,18 @@ use crate::{
     listeners::order_book::{
         InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
     },
-    order_book::{Coin, Side, Snapshot},
+    order_book::{Coin, Snapshot},
     prelude::*,
     types::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
         inner::InnerLevel,
-        node_data::{Batch, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
+        node_data::{Batch, NodeDataOrderDiff, NodeDataOrderStatus},
         subscription::{ClientMessage, DEFAULT_LEVELS, ServerResponse, Subscription, SubscriptionManager},
     },
 };
 use axum::{Router, response::IntoResponse, routing::get};
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info, warn};
+use log::{error, info};
 use std::{
     collections::{HashMap, HashSet},
     env::home_dir,
@@ -127,14 +127,9 @@ async fn handle_socket(
                                     send_ws_data_from_snapshot(&mut socket, sub, l2_snapshots.as_ref(), *time).await;
                                 }
                             },
-                            InternalMessage::Fills{ batch } => {
-                                // Assembling trades walks every fill in the batch; skip it on
-                                // connections with no trades subscription (most are l2Book-only).
-                                if manager.subscriptions().iter().any(|s| matches!(s, Subscription::Trades { .. })) {
-                                    let mut trades = coin_to_trades(batch);
-                                    for sub in manager.subscriptions() {
-                                        send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
-                                    }
+                            InternalMessage::Trades{ trades } => {
+                                for sub in manager.subscriptions() {
+                                    send_ws_data_from_trades(&mut socket, sub, trades).await;
                                 }
                             },
                             InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
@@ -286,31 +281,6 @@ async fn send_ws_data_from_snapshot(
     }
 }
 
-fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
-    // The two fills of a trade are not necessarily adjacent in the batch (a
-    // taker sweeping several makers interleaves them), so pair by tid rather
-    // than position, and drop incomplete pairs rather than panicking.
-    let mut pending: HashMap<u64, HashMap<Side, NodeDataFill>> = HashMap::new();
-    let mut trades: HashMap<String, Vec<Trade>> = HashMap::new();
-    let mut dropped = 0_usize;
-    for fill in batch.clone().events() {
-        let tid = fill.1.tid;
-        let sides = pending.entry(tid).or_default();
-        sides.insert(fill.1.side, fill);
-        if sides.len() == 2 {
-            match pending.remove(&tid).and_then(Trade::from_fills) {
-                Some(trade) => trades.entry(trade.coin.clone()).or_default().push(trade),
-                None => dropped += 1,
-            }
-        }
-    }
-    dropped += pending.len();
-    if dropped > 0 {
-        warn!("Dropped {dropped} unpaired fills at block {}", batch.block_number());
-    }
-    trades
-}
-
 fn coin_to_book_updates(
     diff_batch: &Batch<NodeDataOrderDiff>,
     status_batch: &Batch<NodeDataOrderStatus>,
@@ -347,11 +317,12 @@ async fn send_ws_data_from_book_updates(
 async fn send_ws_data_from_trades(
     socket: &mut WebSocket,
     subscription: &Subscription,
-    trades: &mut HashMap<String, Vec<Trade>>,
+    trades: &HashMap<String, Vec<Trade>>,
 ) {
     if let Subscription::Trades { coin } = subscription {
-        if let Some(trades) = trades.remove(coin) {
-            let msg = ServerResponse::Trades(trades);
+        if let Some(trades) = trades.get(coin) {
+            // the message is Arc-shared across connections; clone only this coin's trades
+            let msg = ServerResponse::Trades(trades.clone());
             send_socket_message(socket, msg).await;
         }
     }
@@ -378,6 +349,15 @@ impl Subscription {
                 return Ok(Some(ServerResponse::L2Book(l2_book)));
             }
             return Err("Snapshot Failed".into());
+        }
+        if let Self::Trades { coin } = self {
+            // Like the public HL WS: seed the subscriber with recent history
+            // so the panel isn't empty until the next trade happens.
+            let trades = listener.lock().await.recent_trades(coin);
+            if trades.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(ServerResponse::Trades(trades)));
         }
         if let Self::L4Book { coin } = self {
             let snapshot = listener.lock().await.compute_snapshot();

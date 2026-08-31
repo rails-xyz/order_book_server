@@ -2,19 +2,19 @@ use crate::{
     HL_NODE,
     listeners::{directory::DirectoryListener, order_book::state::OrderBookState},
     order_book::{
-        Coin, Snapshot,
+        Coin, Side, Snapshot,
         multi_book::{Snapshots, load_snapshots_from_json},
     },
     prelude::*,
     types::{
-        L4Order,
+        L4Order, Trade,
         inner::{InnerL4Order, InnerLevel},
         node_data::{Batch, EventSource, NodeDataFill, NodeDataOrderDiff, NodeDataOrderStatus},
     },
 };
 use alloy::primitives::Address;
 use fs::File;
-use log::{error, info};
+use log::{error, info, warn};
 use notify::{Event, RecursiveMode, Watcher, recommended_watcher};
 use std::{
     cmp::Ordering,
@@ -200,6 +200,38 @@ fn fetch_snapshot(
     });
 }
 
+// Matches the rough depth of the public HL WS trades snapshot; the UI panel
+// shows far fewer.
+const RECENT_TRADES_CAP: usize = 100;
+
+// Trades are assembled once here rather than per connection: every fills batch
+// fans out to all subscribers, and the recent-trades buffer needs them anyway.
+fn coin_to_trades(batch: Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
+    // The two fills of a trade are not necessarily adjacent in the batch (a
+    // taker sweeping several makers interleaves them), so pair by tid rather
+    // than position, and drop incomplete pairs rather than panicking.
+    let block_number = batch.block_number();
+    let mut pending: HashMap<u64, HashMap<Side, NodeDataFill>> = HashMap::new();
+    let mut trades: HashMap<String, Vec<Trade>> = HashMap::new();
+    let mut dropped = 0_usize;
+    for fill in batch.events() {
+        let tid = fill.1.tid;
+        let sides = pending.entry(tid).or_default();
+        sides.insert(fill.1.side, fill);
+        if sides.len() == 2 {
+            match pending.remove(&tid).and_then(Trade::from_fills) {
+                Some(trade) => trades.entry(trade.coin.clone()).or_default().push(trade),
+                None => dropped += 1,
+            }
+        }
+    }
+    dropped += pending.len();
+    if dropped > 0 {
+        warn!("Dropped {dropped} unpaired fills at block {block_number}");
+    }
+    trades
+}
+
 pub(crate) struct OrderBookListener {
     ignore_spot: bool,
     fill_status_file: Option<File>,
@@ -208,6 +240,9 @@ pub(crate) struct OrderBookListener {
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
     last_fill: Option<u64>,
+    // Chronological per coin, capped at RECENT_TRADES_CAP; seeds new trades
+    // subscribers so they don't stare at an empty panel until the next trade
+    recent_trades: HashMap<String, VecDeque<Trade>>,
     order_diff_cache: BatchQueue<NodeDataOrderDiff>,
     order_status_cache: BatchQueue<NodeDataOrderStatus>,
     // Only Some when we want it to collect updates
@@ -216,7 +251,7 @@ pub(crate) struct OrderBookListener {
 }
 
 impl OrderBookListener {
-    pub(crate) const fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
+    pub(crate) fn new(internal_message_tx: Option<Sender<Arc<InternalMessage>>>, ignore_spot: bool) -> Self {
         Self {
             ignore_spot,
             fill_status_file: None,
@@ -224,6 +259,7 @@ impl OrderBookListener {
             order_diff_file: None,
             order_book_state: None,
             last_fill: None,
+            recent_trades: HashMap::new(),
             fetched_snapshot_cache: None,
             internal_message_tx,
             order_diff_cache: BatchQueue::new(),
@@ -279,14 +315,28 @@ impl OrderBookListener {
                 self.order_diff_cache.push(batch);
             }
             EventBatch::Fills(batch) => {
+                // Recording last_fill (upstream never assigned it) makes this
+                // guard effective against torn-read replays: a partial last
+                // line rewinds the whole chunk, re-parsing completed blocks —
+                // without the guard those trades would be re-broadcast and
+                // double-inserted into recent_trades.
                 if self.last_fill.is_none_or(|height| height < batch.block_number()) {
-                    // send fill updates if we received a new update
-                    if let Some(tx) = &self.internal_message_tx {
-                        let tx = tx.clone();
-                        tokio::spawn(async move {
-                            let snapshot = Arc::new(InternalMessage::Fills { batch });
-                            let _unused = tx.send(snapshot);
-                        });
+                    self.last_fill = Some(batch.block_number());
+                    let trades = coin_to_trades(batch);
+                    if !trades.is_empty() {
+                        for (coin, coin_trades) in &trades {
+                            let buffer = self.recent_trades.entry(coin.clone()).or_default();
+                            buffer.extend(coin_trades.iter().cloned());
+                            while buffer.len() > RECENT_TRADES_CAP {
+                                buffer.pop_front();
+                            }
+                        }
+                        if let Some(tx) = &self.internal_message_tx {
+                            // broadcast::send is sync; sending inline (upstream
+                            // spawned a task) keeps frames ordered with the
+                            // subscribe-time snapshot reads.
+                            let _unused = tx.send(Arc::new(InternalMessage::Trades { trades }));
+                        }
                     }
                 }
             }
@@ -356,6 +406,11 @@ impl OrderBookListener {
     // None until the first snapshot seeds the book
     pub(crate) fn l2_snapshots_now(&self) -> Option<(u64, L2Snapshots)> {
         self.order_book_state.as_ref().map(OrderBookState::l2_snapshots_now)
+    }
+
+    // Oldest first, matching the order of streamed frames
+    pub(crate) fn recent_trades(&self, coin: &str) -> Vec<Trade> {
+        self.recent_trades.get(coin).map_or_else(Vec::new, |buffer| buffer.iter().cloned().collect())
     }
 }
 
@@ -484,7 +539,9 @@ pub(crate) struct TimedSnapshots {
 // Messages sent from node data listener to websocket dispatch to support streaming
 pub(crate) enum InternalMessage {
     Snapshot { l2_snapshots: L2Snapshots, time: u64 },
-    Fills { batch: Batch<NodeDataFill> },
+    // Trades are pre-assembled from the fills batch so the work happens once,
+    // not on every connection
+    Trades { trades: HashMap<String, Vec<Trade>> },
     L4BookUpdates { diff_batch: Batch<NodeDataOrderDiff>, status_batch: Batch<NodeDataOrderStatus> },
 }
 

@@ -12,7 +12,7 @@ pub(crate) mod inner;
 pub(crate) mod node_data;
 pub(crate) mod subscription;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Trade {
     pub coin: String,
     side: Side,
