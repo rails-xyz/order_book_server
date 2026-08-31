@@ -492,7 +492,10 @@ impl DirectoryListener for OrderBookListener {
                     error!(
                         "{event_source} serialization error {err}, height: {:?}, line: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
-                        &line[..100],
+                        // A torn line can be cut before byte 100; a hard [..100]
+                        // slice panics then (the content is ASCII JSON, so no
+                        // char-boundary concern)
+                        &line[..line.len().min(100)],
                     );
                     #[allow(clippy::unwrap_used)]
                     let total_len: i64 = total_len.try_into().unwrap();

@@ -39,6 +39,16 @@ struct Args {
 async fn main() -> Result<()> {
     env_logger::init();
 
+    // Tokio swallows panics in spawned tasks: a panic in the listener task
+    // leaves the process alive serving a frozen book, with the stall watchdog
+    // and snapshot validation dead alongside it, so systemd never restarts it.
+    // Crash-only healing requires every panic to take the process down.
+    let default_panic_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        default_panic_hook(panic_info);
+        std::process::exit(1);
+    }));
+
     let args = Args::parse();
 
     let full_address = format!("{}:{}", args.address, args.port);
