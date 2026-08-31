@@ -39,7 +39,11 @@ mod utils;
 
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
-pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: PathBuf) -> Result<()> {
+pub(crate) async fn hl_listen(
+    listener: Arc<Mutex<OrderBookListener>>,
+    dir: PathBuf,
+    snapshot_validation_interval: Duration,
+) -> Result<()> {
     let order_statuses_dir = EventSource::OrderStatuses.event_source_dir(&dir).canonicalize()?;
     let fills_dir = EventSource::Fills.event_source_dir(&dir).canonicalize()?;
     let order_diffs_dir = EventSource::OrderDiffs.event_source_dir(&dir).canonicalize()?;
@@ -70,6 +74,7 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
     watcher.watch(&order_diffs_dir, RecursiveMode::Recursive)?;
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(10));
+    let mut last_snapshot_fetch: Option<Instant> = None;
     loop {
         tokio::select! {
             event = fs_event_rx.recv() =>  match event {
@@ -118,9 +123,17 @@ pub(crate) async fn hl_listen(listener: Arc<Mutex<OrderBookListener>>, dir: Path
                 }
             }
             _ = ticker.tick() => {
-                let listener = listener.clone();
-                let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
-                fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                // Retry at ticker cadence until the first snapshot seeds the book,
+                // but validate at the configured interval once ready: each fetch
+                // makes the node dump its entire L4 state, which is heavy enough
+                // to stall block execution when repeated too often.
+                let ready = listener.lock().await.is_ready();
+                if !ready || last_snapshot_fetch.is_none_or(|at| at.elapsed() >= snapshot_validation_interval) {
+                    last_snapshot_fetch = Some(Instant::now());
+                    let listener = listener.clone();
+                    let snapshot_fetch_task_tx = snapshot_fetch_task_tx.clone();
+                    fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
+                }
             }
             () = sleep(Duration::from_secs(5)) => {
                 let listener = listener.lock().await;
@@ -338,6 +351,11 @@ impl OrderBookListener {
     // prevent snapshotting mutiple times at the same height
     fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
         self.order_book_state.as_mut().and_then(|o| o.l2_snapshots(prevent_future_snaps))
+    }
+
+    // None until the first snapshot seeds the book
+    pub(crate) fn l2_snapshots_now(&self) -> Option<(u64, L2Snapshots)> {
+        self.order_book_state.as_ref().map(OrderBookState::l2_snapshots_now)
     }
 }
 

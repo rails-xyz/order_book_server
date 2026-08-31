@@ -1,0 +1,54 @@
+[100, 
+    [
+        [
+            "@1",
+            [
+                [
+                    [
+                        "0x0000000000000000000000000000000000000000",
+                        {
+                            "coin": "@1",
+                            "side": "B",
+                            "limitPx": "30.444",
+                            "sz": "100.0",
+                            "oid": 105338503859,
+                            "timestamp": 1750660644034,
+                            "triggerCondition": "N/A",
+                            "isTrigger": false,
+                            "triggerPx": "0.0",
+                            "children": [],
+                            "isPositionTpsl": false,
+                            "reduceOnly": false,
+                            "orderType": "Limit",
+                            "origSz": "100.0",
+                            "tif": "Alo",
+                            "cloid": null
+                        }
+                    ],
+                    [
+                        "0x0000000000000000000000000000000000000000",
+                        {
+                            "coin": "@1",
+                            "side": "B",
+                            "limitPx": "30.385",
+                            "sz": "5.45",
+                            "oid": 105337808436,
+                            "timestamp": 1750660453608,
+                            "triggerCondition": "N/A",
+                            "isTrigger": false,
+                            "triggerPx": "0.0",
+                            "children": [],
+                            "isPositionTpsl": false,
+                            "reduceOnly": false,
+                            "orderType": "Limit",
+                            "origSz": "5.45",
+                            "tif": "Gtc",
+                            "cloid": null
+                        }
+                    ]
+                ],
+                []
+            ]
+        ]
+    ]
+]

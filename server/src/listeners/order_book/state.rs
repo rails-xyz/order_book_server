@@ -47,6 +47,12 @@ impl OrderBookState {
         TimedSnapshots { time: self.time, height: self.height, snapshot: self.order_book.to_snapshots_par() }
     }
 
+    // On-demand snapshot for subscribe-time sends; bypasses the per-height
+    // `snapped` gate so it works even after the streaming path snapped this height
+    pub(super) fn l2_snapshots_now(&self) -> (u64, L2Snapshots) {
+        (self.time, compute_l2_snapshots(&self.order_book))
+    }
+
     // (time, snapshot)
     pub(super) fn l2_snapshots(&mut self, prevent_future_snaps: bool) -> Option<(u64, L2Snapshots)> {
         if self.snapped {

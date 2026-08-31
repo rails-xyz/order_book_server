@@ -1,5 +1,6 @@
 #![allow(unused_crate_dependencies)]
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 use clap::Parser;
 use server::{Result, run_websocket_server};
@@ -25,6 +26,13 @@ struct Args {
     /// documentation for <https://docs.rs/flate2/1.1.2/flate2/struct.Compression.html#method.new> for more info.
     #[arg(long)]
     websocket_compression_level: Option<u32>,
+
+    /// Seconds between snapshot validations once the book is seeded. Each
+    /// validation makes the node dump its full L4 state to disk, which is
+    /// heavy enough to stall the node's block execution when run too often.
+    /// Seeding always retries every 10s until the first snapshot succeeds.
+    #[arg(long, default_value_t = 10)]
+    snapshot_validation_interval_secs: u64,
 }
 
 #[tokio::main]
@@ -37,7 +45,13 @@ async fn main() -> Result<()> {
     println!("Running websocket server on {full_address}");
 
     let compression_level = args.websocket_compression_level.unwrap_or(/* Some compression */ 1);
-    run_websocket_server(&full_address, true, compression_level).await?;
+    run_websocket_server(
+        &full_address,
+        true,
+        compression_level,
+        Duration::from_secs(args.snapshot_validation_interval_secs),
+    )
+    .await?;
 
     Ok(())
 }

@@ -2,7 +2,7 @@ use crate::{
     listeners::order_book::{
         InternalMessage, L2SnapshotParams, L2Snapshots, OrderBookListener, TimedSnapshots, hl_listen,
     },
-    order_book::{Coin, Snapshot},
+    order_book::{Coin, Side, Snapshot},
     prelude::*,
     types::{
         L2Book, L4Book, L4BookUpdates, L4Order, Trade,
@@ -13,7 +13,7 @@ use crate::{
 };
 use axum::{Router, response::IntoResponse, routing::get};
 use futures_util::{SinkExt, StreamExt};
-use log::{error, info};
+use log::{error, info, warn};
 use std::{
     collections::{HashMap, HashSet},
     env::home_dir,
@@ -29,7 +29,12 @@ use tokio::{
 };
 use yawc::{FrameView, OpCode, WebSocket};
 
-pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_level: u32) -> Result<()> {
+pub async fn run_websocket_server(
+    address: &str,
+    ignore_spot: bool,
+    compression_level: u32,
+    snapshot_validation_interval: std::time::Duration,
+) -> Result<()> {
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(100);
 
     // Central task: listen to messages and forward them for distribution
@@ -42,7 +47,7 @@ pub async fn run_websocket_server(address: &str, ignore_spot: bool, compression_
     {
         let listener = listener.clone();
         tokio::spawn(async move {
-            if let Err(err) = hl_listen(listener, home_dir).await {
+            if let Err(err) = hl_listen(listener, home_dir, snapshot_validation_interval).await {
                 error!("Listener fatal error: {err}");
                 std::process::exit(1);
             }
@@ -123,15 +128,21 @@ async fn handle_socket(
                                 }
                             },
                             InternalMessage::Fills{ batch } => {
-                                let mut trades = coin_to_trades(batch);
-                                for sub in manager.subscriptions() {
-                                    send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                // Assembling trades walks every fill in the batch; skip it on
+                                // connections with no trades subscription (most are l2Book-only).
+                                if manager.subscriptions().iter().any(|s| matches!(s, Subscription::Trades { .. })) {
+                                    let mut trades = coin_to_trades(batch);
+                                    for sub in manager.subscriptions() {
+                                        send_ws_data_from_trades(&mut socket, sub, &mut trades).await;
+                                    }
                                 }
                             },
                             InternalMessage::L4BookUpdates{ diff_batch, status_batch } => {
-                                let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
-                                for sub in manager.subscriptions() {
-                                    send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
+                                if manager.subscriptions().iter().any(|s| matches!(s, Subscription::L4Book { .. })) {
+                                    let mut book_updates = coin_to_book_updates(diff_batch, status_batch);
+                                    for sub in manager.subscriptions() {
+                                        send_ws_data_from_book_updates(&mut socket, sub, &mut book_updates).await;
+                                    }
                                 }
                             },
                         }
@@ -276,24 +287,26 @@ async fn send_ws_data_from_snapshot(
 }
 
 fn coin_to_trades(batch: &Batch<NodeDataFill>) -> HashMap<String, Vec<Trade>> {
-    let mut fills = batch.clone().events();
-    let mut trades = HashMap::new();
-    while fills.len() >= 2 {
-        let f2 = fills.pop();
-        let f1 = fills.pop();
-        if let Some(f1) = f1 {
-            if let Some(f2) = f2 {
-                let mut fills = HashMap::new();
-                fills.insert(f1.1.side, f1);
-                fills.insert(f2.1.side, f2);
-                let trade = Trade::from_fills(fills);
-                let coin = trade.coin.clone();
-                trades.entry(coin).or_insert_with(Vec::new).push(trade);
+    // The two fills of a trade are not necessarily adjacent in the batch (a
+    // taker sweeping several makers interleaves them), so pair by tid rather
+    // than position, and drop incomplete pairs rather than panicking.
+    let mut pending: HashMap<u64, HashMap<Side, NodeDataFill>> = HashMap::new();
+    let mut trades: HashMap<String, Vec<Trade>> = HashMap::new();
+    let mut dropped = 0_usize;
+    for fill in batch.clone().events() {
+        let tid = fill.1.tid;
+        let sides = pending.entry(tid).or_default();
+        sides.insert(fill.1.side, fill);
+        if sides.len() == 2 {
+            match pending.remove(&tid).and_then(Trade::from_fills) {
+                Some(trade) => trades.entry(trade.coin.clone()).or_default().push(trade),
+                None => dropped += 1,
             }
         }
     }
-    for list in trades.values_mut() {
-        list.reverse();
+    dropped += pending.len();
+    if dropped > 0 {
+        warn!("Dropped {dropped} unpaired fills at block {}", batch.block_number());
     }
     trades
 }
@@ -350,6 +363,22 @@ impl Subscription {
         &self,
         listener: Arc<Mutex<OrderBookListener>>,
     ) -> Result<Option<ServerResponse>> {
+        if let Self::L2Book { coin, n_sig_figs, n_levels, mantissa } = self {
+            // Without this a reconnecting client shows a stale book until the
+            // next block-driven frame arrives.
+            let snapshot = listener.lock().await.l2_snapshots_now().and_then(|(time, snapshots)| {
+                snapshots
+                    .as_ref()
+                    .get(&Coin::new(coin))
+                    .and_then(|entries| entries.get(&L2SnapshotParams::new(*n_sig_figs, *mantissa)))
+                    .map(|snapshot| (time, snapshot.truncate(n_levels.unwrap_or(DEFAULT_LEVELS))))
+            });
+            if let Some((time, snapshot)) = snapshot {
+                let l2_book = L2Book::from_l2_snapshot(coin.clone(), snapshot.export_inner_snapshot(), time);
+                return Ok(Some(ServerResponse::L2Book(l2_book)));
+            }
+            return Err("Snapshot Failed".into());
+        }
         if let Self::L4Book { coin } = self {
             let snapshot = listener.lock().await.compute_snapshot();
             if let Some(TimedSnapshots { time, height, snapshot }) = snapshot {
