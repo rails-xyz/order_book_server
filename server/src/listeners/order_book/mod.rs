@@ -176,15 +176,34 @@ fn fetch_snapshot(
                                 if let Some((order_statuses, order_diffs)) = cache.pop_front() {
                                     state.apply_updates(order_statuses, order_diffs)?;
                                 } else {
-                                    return Err::<(), Error>("Not enough cached updates".into());
+                                    // Early returns here skip tx.send, so they are
+                                    // non-fatal by construction; without the log they
+                                    // are invisible.
+                                    warn!("Not enough cached updates; skipping validation this cycle");
+                                    return Ok::<(), Error>(());
                                 }
                             }
                             if state.height() > height {
-                                return Err("Fetched snapshot lagging stored state".into());
+                                warn!("Fetched snapshot lagging stored state; skipping validation this cycle");
+                                return Ok(());
                             }
                             let stored_snapshot = state.compute_snapshot().snapshot;
                             info!("Validating snapshot");
-                            validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot)
+                            match validate_snapshot_consistency(&stored_snapshot, expected_snapshot, ignore_spot) {
+                                Ok(()) => Ok(()),
+                                Err(err) => {
+                                    // The node re-prices triggered stop orders as they
+                                    // enter the book, and the status event only carries
+                                    // the placement-time px, so the reconstruction
+                                    // drifts whenever a triggered stop rests. Exiting
+                                    // here (the upstream behavior) drops every WS and
+                                    // MQTT consumer for a divergence the boot path can
+                                    // repair; resync in-process instead.
+                                    error!("Snapshot validation failed; resyncing from next snapshot: {err}");
+                                    listener.lock().await.reset_state();
+                                    Ok(())
+                                }
+                            }
                         } else {
                             listener.lock().await.init_from_snapshot(expected_snapshot, height);
                             Ok(())
@@ -284,6 +303,13 @@ impl OrderBookListener {
 
     pub(crate) const fn is_ready(&self) -> bool {
         self.order_book_state.is_some()
+    }
+
+    // Forget the book so the next ticker fetch re-seeds via init_from_snapshot;
+    // while None, receive_batch queues updates instead of applying them, and the
+    // fallen-behind watchdog is disarmed - the same regime as before first seed.
+    fn reset_state(&mut self) {
+        self.order_book_state = None;
     }
 
     pub(crate) fn universe(&self) -> HashSet<Coin> {
