@@ -467,13 +467,36 @@ impl OrderBookListener {
             } else {
                 info!("-- Event: {} modified, tracking it now --", new_path.display());
                 let file = self.file_mut(event_source);
-                let mut new_file = File::open(new_path)?;
-                new_file.seek(SeekFrom::End(0))?;
-                *file = Some(new_file);
+                *file = Some(open_tail_at_line_boundary(new_path)?);
             }
         }
         Ok(())
     }
+}
+
+// Attaching to a live file must land on a line boundary: End(0) can fall
+// inside a line the writer is mid-flush on, and the rewind-on-error recovery
+// in process_data then retries that mid-line offset forever (2026-09-04:
+// stalled OrderStatuses — and the book — until a restart). Position at the
+// start of the trailing partial line instead; its batch is then processed
+// once the writer finishes it.
+fn open_tail_at_line_boundary(path: &PathBuf) -> Result<File> {
+    let mut file = File::open(path)?;
+    let mut pos = file.seek(SeekFrom::End(0))?;
+    let mut buf = vec![0_u8; 64 * 1024];
+    while pos > 0 {
+        let read_from = pos.saturating_sub(buf.len() as u64);
+        let len = usize::try_from(pos - read_from)?;
+        file.seek(SeekFrom::Start(read_from))?;
+        file.read_exact(&mut buf[..len])?;
+        if let Some(newline) = buf[..len].iter().rposition(|&byte| byte == b'\n') {
+            file.seek(SeekFrom::Start(read_from + u64::try_from(newline)? + 1))?;
+            return Ok(file);
+        }
+        pos = read_from;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(file)
 }
 
 impl DirectoryListener for OrderBookListener {
@@ -507,8 +530,8 @@ impl DirectoryListener for OrderBookListener {
 
     fn process_data(&mut self, data: String, event_source: EventSource) -> Result<()> {
         let total_len = data.len();
-        let lines = data.lines();
-        for line in lines {
+        let lines: Vec<&str> = data.lines().collect();
+        for (index, line) in lines.iter().copied().enumerate() {
             if line.is_empty() {
                 continue;
             }
@@ -525,7 +548,6 @@ impl DirectoryListener for OrderBookListener {
             let (height, event_batch) = match res {
                 Ok(data) => data,
                 Err(err) => {
-                    // if we run into a serialization error (hitting EOF), just return to last line.
                     error!(
                         "{event_source} serialization error {err}, height: {:?}, line: {:?}",
                         self.order_book_state.as_ref().map(OrderBookState::height),
@@ -534,6 +556,15 @@ impl DirectoryListener for OrderBookListener {
                         // char-boundary concern)
                         &line[..line.len().min(100)],
                     );
+                    // Only the chunk's last line can be a torn read that heals
+                    // once the writer finishes it; rewind and let the next
+                    // read retry. A bad line with data after it never heals —
+                    // rewinding to it retries forever and stalls the stream —
+                    // so drop it and let snapshot validation resync any drift.
+                    if index + 1 < lines.len() {
+                        error!("{event_source} unparseable line has data after it; skipping one line");
+                        continue;
+                    }
                     #[allow(clippy::unwrap_used)]
                     let total_len: i64 = total_len.try_into().unwrap();
                     self.file_mut(event_source).as_mut().map(|f| f.seek_relative(-total_len));
@@ -598,4 +629,38 @@ pub(crate) enum InternalMessage {
 pub(crate) struct L2SnapshotParams {
     n_sig_figs: Option<u32>,
     mantissa: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn tail_offset(name: &str, contents: &[u8]) -> u64 {
+        let path = std::env::temp_dir().join(format!("obs_tail_{}_{name}", std::process::id()));
+        fs::write(&path, contents).unwrap();
+        let mut file = open_tail_at_line_boundary(&path).unwrap();
+        let offset = file.stream_position().unwrap();
+        fs::remove_file(&path).unwrap();
+        offset
+    }
+
+    #[test]
+    fn tail_open_lands_on_line_boundaries() {
+        assert_eq!(tail_offset("empty", b""), 0);
+        assert_eq!(tail_offset("complete", b"{\"a\":1}\n{\"b\":2}\n"), 16);
+        // Trailing partial line: position at its start, not at End(0).
+        assert_eq!(tail_offset("partial", b"{\"a\":1}\n{\"b\""), 8);
+        assert_eq!(tail_offset("no_newline", b"{\"a\""), 0);
+    }
+
+    #[test]
+    fn tail_open_scans_back_past_chunk_size() {
+        // Partial line longer than the 64KB scan chunk: the newline sits in
+        // an earlier chunk.
+        let mut contents = Vec::new();
+        contents.write_all(b"{\"a\":1}\n").unwrap();
+        contents.extend(std::iter::repeat_n(b'x', 100 * 1024));
+        assert_eq!(tail_offset("long_partial", &contents), 8);
+    }
 }

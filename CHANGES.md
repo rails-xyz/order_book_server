@@ -80,3 +80,17 @@ after the crash above, the reconnect raced the still-full request channel, the
 subscribe failed, and the publisher ran deaf — health flowing, every watch expired,
 no book frames — until manually restarted. After: subscription state is tracked
 (confirmed only by SubAck) and re-attempted every housekeeping tick until it lands.
+
+## (2026-09-04) — Attach to live files on a line boundary; skip unhealable lines
+
+**Bug (upstream).** Attaching to an already-written file seeked to `End(0)`, which can
+land inside a line the writer is mid-flush on; the torn-read recovery (rewind, retry)
+then retries that mid-line offset forever. A restart during activity stalled
+OrderStatuses at one height while fills/diffs advanced — empty books until another
+restart happened to land on a boundary. After: attach scans back to the last newline
+and starts at the trailing partial line, which parses once the writer completes it.
+
+**Bug (upstream).** Same recovery path: any permanently bad line (not just a
+misaligned attach) was rewound to and retried forever. After: only the chunk's last
+line — the only one a torn read can explain — is rewound; a bad line with data after
+it is dropped, and snapshot validation resyncs any drift.
