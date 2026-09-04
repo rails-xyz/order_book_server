@@ -64,3 +64,19 @@ stop-heavy periods. Before: each mismatch dropped all WS/MQTT consumers for ~15s
 After: the book state resets and re-seeds from the next snapshot in-process;
 connections and MQTT watches survive. Two silent early-returns in the validation task
 are now logged.
+
+## (2026-09-04) — Cap MQTT payloads below the packet limit; self-healing presence subscribe
+
+**Bug.** MQTT publishes are atomic (the protocol has no fragmentation), and rumqttc
+raises an over-limit outgoing packet as a connection-level error: a 148KB trades frame
+(AWS IoT caps packets at 128KB) tore the connection down. Before: one oversized frame
+killed the connection; frames queued during the outage filled the bounded request
+channel. After: trades seeds drop oldest trades to fit, oversized live batches split
+in half into consecutive frames, and any payload still over the cap is dropped as one
+frame in `publish_payload` — nothing oversized reaches rumqttc. Channel cap 128 → 512.
+
+**Bug.** The presence subscribe was attempted once per ConnAck via `try_subscribe`;
+after the crash above, the reconnect raced the still-full request channel, the
+subscribe failed, and the publisher ran deaf — health flowing, every watch expired,
+no book frames — until manually restarted. After: subscription state is tracked
+(confirmed only by SubAck) and re-attempted every housekeeping tick until it lands.

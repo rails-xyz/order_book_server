@@ -13,7 +13,7 @@ use crate::{
     },
 };
 use log::{info, warn};
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, TlsConfiguration, Transport};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, SubscribeReasonCode, TlsConfiguration, Transport};
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
@@ -46,9 +46,15 @@ const BACKOFF_MIN: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const WARN_INTERVAL: Duration = Duration::from_secs(10);
 const SNAPSHOT_FALLBACK_DEBOUNCE: Duration = Duration::from_secs(1);
-const MQTT_CHANNEL_CAP: usize = 128;
-// AWS IoT caps payloads at 128KB; a 100-trade seed is ~25KB.
+// Frames queued while the connection is down share this channel with the
+// post-reconnect resubscribe; headroom keeps a backlog from starving it.
+const MQTT_CHANNEL_CAP: usize = 512;
+// AWS IoT caps MQTT packets at 128KB, and rumqttc raises a violation inside
+// the event loop as a connection-level error — one oversized frame tears the
+// connection down (2026-09-04: a 148KB trades frame). Payloads are therefore
+// capped before publish, with margin for topic + protocol overhead.
 const MAX_PACKET_SIZE: usize = 128 * 1024;
+const MAX_PAYLOAD_BYTES: usize = MAX_PACKET_SIZE - 4 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct MqttConfig {
@@ -314,6 +320,28 @@ pub(crate) fn seed_due(dirty: bool, last_published: Option<Instant>, now: Instan
     dirty && last_published.is_none_or(|last| now.duration_since(last) >= interval)
 }
 
+// Trade JSON has no fixed size (px/sz digit counts vary), so the seed keeps
+// the newest suffix of the ring that fits the packet cap. Returns the frame
+// and how many oldest trades were dropped; None if nothing fits.
+fn capped_trades_seed(ring: &VecDeque<Trade>) -> Option<(Vec<u8>, usize)> {
+    let mut skip = 0;
+    loop {
+        let response = ServerResponse::Trades(ring.iter().skip(skip).cloned().collect());
+        let payload = match serde_json::to_vec(&response) {
+            Ok(payload) => payload,
+            Err(err) => {
+                warn!("Trades seed serialization error: {err}");
+                return None;
+            }
+        };
+        if payload.len() <= MAX_PAYLOAD_BYTES {
+            return (skip < ring.len()).then_some((payload, skip));
+        }
+        let avg = payload.len() / (ring.len() - skip);
+        skip = (skip + (payload.len() - MAX_PAYLOAD_BYTES) / avg.max(1) + 1).min(ring.len());
+    }
+}
+
 fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -334,6 +362,11 @@ struct Publisher {
     rr_offset: usize,
     drop_warn: WarnLimiter,
     reject_warn: WarnLimiter,
+    oversize_warn: WarnLimiter,
+    // False from ConnAck until the SubAck lands: try_subscribe can fail when
+    // the request channel is still full right after a reconnect, and a missed
+    // subscribe otherwise leaves the publisher deaf to presence forever.
+    presence_subscribed: bool,
 }
 
 impl Publisher {
@@ -352,6 +385,17 @@ impl Publisher {
             rr_offset: 0,
             drop_warn: WarnLimiter::new(WARN_INTERVAL),
             reject_warn: WarnLimiter::new(WARN_INTERVAL),
+            oversize_warn: WarnLimiter::new(WARN_INTERVAL),
+            presence_subscribed: false,
+        }
+    }
+
+    fn ensure_presence_subscribed(&self) {
+        if self.presence_subscribed {
+            return;
+        }
+        if let Err(err) = self.client.try_subscribe(PRESENCE_FILTER, QoS::AtMostOnce) {
+            warn!("MQTT presence subscribe failed (will retry): {err}");
         }
     }
 
@@ -417,10 +461,11 @@ impl Publisher {
                 if seed.ring.is_empty() {
                     return;
                 }
-                let response = ServerResponse::Trades(seed.ring.iter().cloned().collect());
+                let Some((payload, dropped)) = capped_trades_seed(&seed.ring) else { return };
                 seed.dirty = false;
                 seed.last_published = Some(now);
-                self.publish_json(&trades_snapshot_topic(&coin), &response, true, now);
+                self.warn_seed_trim(&coin, dropped, now);
+                self.publish_payload(&trades_snapshot_topic(&coin), payload, true, now);
             }
         }
     }
@@ -467,7 +512,7 @@ impl Publisher {
             }
             // Non-retained: a dropped live frame is recovered by the next
             // retained seed republish within trades_seed_interval.
-            self.publish_json(&trades_stream_topic(coin), &ServerResponse::Trades(batch.clone()), false, now);
+            self.publish_trades_batch(coin, batch, now);
             let seed = self.trades.entry(coin.clone()).or_default();
             seed.ring.extend(batch.iter().cloned());
             while seed.ring.len() > RECENT_TRADES_CAP {
@@ -477,8 +522,39 @@ impl Publisher {
         }
     }
 
+    // A burst batch can serialize past the packet cap; halving splits it into
+    // consecutive frames (order preserved) instead of losing the batch.
+    fn publish_trades_batch(&mut self, coin: &str, batch: &[Trade], now: Instant) {
+        match serde_json::to_vec(&ServerResponse::Trades(batch.to_vec())) {
+            Ok(payload) if payload.len() <= MAX_PAYLOAD_BYTES => {
+                self.publish_payload(&trades_stream_topic(coin), payload, false, now);
+            }
+            Ok(_) if batch.len() > 1 => {
+                let mid = batch.len() / 2;
+                self.publish_trades_batch(coin, &batch[..mid], now);
+                self.publish_trades_batch(coin, &batch[mid..], now);
+            }
+            Ok(payload) => {
+                if self.oversize_warn.allow(now) {
+                    warn!("Dropping {}-byte single-trade frame over packet cap on {coin}", payload.len());
+                }
+            }
+            Err(err) => warn!("MQTT payload serialization error for {coin} trades: {err}"),
+        }
+    }
+
+    fn warn_seed_trim(&mut self, coin: &str, dropped: usize, now: Instant) {
+        if dropped > 0 && self.oversize_warn.allow(now) {
+            warn!("Trades seed for {coin} over packet cap; dropped {dropped} oldest trades");
+        }
+    }
+
     fn housekeeping(&mut self) {
         let now = Instant::now();
+        // clean_session drops server-side subscription state on reconnect and
+        // the ConnAck-time subscribe can race a full request channel, so keep
+        // retrying until the SubAck confirms it.
+        self.ensure_presence_subscribed();
         for key in self.registry.sweep(now) {
             // Clearing the retained frame keeps late subscribers from
             // rendering a book that stopped updating when its last watcher
@@ -511,8 +587,9 @@ impl Publisher {
             .collect();
         for coin in due {
             let Some(seed) = self.trades.get(&coin) else { continue };
-            let response = ServerResponse::Trades(seed.ring.iter().cloned().collect());
-            if self.publish_json(&trades_snapshot_topic(&coin), &response, true, now)
+            let Some((payload, dropped)) = capped_trades_seed(&seed.ring) else { continue };
+            self.warn_seed_trim(&coin, dropped, now);
+            if self.publish_payload(&trades_snapshot_topic(&coin), payload, true, now)
                 && let Some(seed) = self.trades.get_mut(&coin)
             {
                 seed.dirty = false;
@@ -521,30 +598,40 @@ impl Publisher {
         }
     }
 
+    fn publish_json(&mut self, topic: &str, response: &ServerResponse, retain: bool, now: Instant) -> bool {
+        match serde_json::to_vec(response) {
+            Ok(payload) => self.publish_payload(topic, payload, retain, now),
+            Err(err) => {
+                warn!("MQTT payload serialization error for {topic}: {err}");
+                false
+            }
+        }
+    }
+
     // try_publish only: an awaited publish from the task that polls the
     // eventloop deadlocks when the request channel fills.
-    fn publish_json(&mut self, topic: &str, response: &ServerResponse, retain: bool, now: Instant) -> bool {
+    fn publish_payload(&mut self, topic: &str, payload: Vec<u8>, retain: bool, now: Instant) -> bool {
+        // Belt-and-braces: an over-cap packet reaching rumqttc kills the whole
+        // connection, so it must die here as one dropped frame instead.
+        if payload.len() > MAX_PAYLOAD_BYTES {
+            if self.oversize_warn.allow(now) {
+                warn!("Dropping {}-byte MQTT payload over packet cap for {topic}", payload.len());
+            }
+            return false;
+        }
         if !self.bucket.try_take(now) {
             if self.drop_warn.allow(now) {
                 warn!("MQTT publish budget ({PUBLISH_RATE_PER_SEC}/s) exhausted; dropping frames (at {topic})");
             }
             return false;
         }
-        match serde_json::to_vec(response) {
-            Ok(payload) => {
-                if let Err(err) = self.client.try_publish(topic, QoS::AtMostOnce, retain, payload) {
-                    if self.drop_warn.allow(now) {
-                        warn!("MQTT publish to {topic} failed: {err}");
-                    }
-                    return false;
-                }
-                true
+        if let Err(err) = self.client.try_publish(topic, QoS::AtMostOnce, retain, payload) {
+            if self.drop_warn.allow(now) {
+                warn!("MQTT publish to {topic} failed: {err}");
             }
-            Err(err) => {
-                warn!("MQTT payload serialization error for {topic}: {err}");
-                false
-            }
+            return false;
         }
+        true
     }
 }
 
@@ -581,10 +668,15 @@ pub(crate) async fn run_mqtt_publisher(
                 Ok(Event::Incoming(Packet::ConnAck(_))) => {
                     info!("MQTT connected; subscribing {PRESENCE_FILTER}");
                     backoff = BACKOFF_MIN;
-                    // clean_session drops server-side subscription state on
-                    // every reconnect, so resubscribe on every ConnAck.
-                    if let Err(err) = publisher.client.try_subscribe(PRESENCE_FILTER, QoS::AtMostOnce) {
-                        warn!("MQTT presence subscribe failed: {err}");
+                    publisher.presence_subscribed = false;
+                    publisher.ensure_presence_subscribed();
+                }
+                Ok(Event::Incoming(Packet::SubAck(ack))) => {
+                    if ack.return_codes.iter().any(|code| matches!(code, SubscribeReasonCode::Failure)) {
+                        warn!("MQTT presence subscribe rejected by broker (will retry)");
+                    } else {
+                        info!("MQTT presence subscription confirmed");
+                        publisher.presence_subscribed = true;
                     }
                 }
                 Ok(Event::Incoming(Packet::Publish(publish))) => {
@@ -598,6 +690,7 @@ pub(crate) async fn run_mqtt_publisher(
                     // Sleeping here stalls the broadcast rx, which is fine:
                     // Lagged is tolerated below.
                     warn!("MQTT connection error (retrying in {backoff:?}): {err}");
+                    publisher.presence_subscribed = false;
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(BACKOFF_MAX);
                 }
@@ -775,5 +868,56 @@ mod tests {
         assert_eq!(l2.retained_topic(), "order-book-stream/l2Book/BTC/full");
         let trades = WatchKey::Trades { coin: "BTC".to_string() };
         assert_eq!(trades.retained_topic(), "order-book-snapshot/trades/BTC");
+    }
+
+    // Trade's fields are private; tests build them through Deserialize, with
+    // px length as the size dial.
+    fn test_trade(tid: u64, px_len: usize) -> Trade {
+        serde_json::from_value(serde_json::json!({
+            "coin": "BTC",
+            "side": "A",
+            "px": "9".repeat(px_len),
+            "sz": "1.0",
+            "hash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "time": 1_756_000_000_000_u64,
+            "tid": tid,
+            "users": [
+                "0x0000000000000000000000000000000000000000",
+                "0x0000000000000000000000000000000000000001"
+            ]
+        }))
+        .unwrap()
+    }
+
+    fn seed_tids(payload: &[u8]) -> Vec<u64> {
+        let frame: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        frame["data"].as_array().unwrap().iter().map(|trade| trade["tid"].as_u64().unwrap()).collect()
+    }
+
+    #[test]
+    fn capped_seed_passes_small_ring_through() {
+        let ring: VecDeque<Trade> = (0..RECENT_TRADES_CAP as u64).map(|tid| test_trade(tid, 8)).collect();
+        let (payload, dropped) = capped_trades_seed(&ring).unwrap();
+        assert_eq!(dropped, 0);
+        assert_eq!(seed_tids(&payload).len(), RECENT_TRADES_CAP);
+    }
+
+    #[test]
+    fn capped_seed_drops_oldest_to_fit() {
+        // ~2KB per trade x 100 ≈ 200KB, well past the cap.
+        let ring: VecDeque<Trade> = (0..100_u64).map(|tid| test_trade(tid, 2_000)).collect();
+        let (payload, dropped) = capped_trades_seed(&ring).unwrap();
+        assert!(payload.len() <= MAX_PAYLOAD_BYTES);
+        assert!(dropped > 0 && dropped < 100);
+        let tids = seed_tids(&payload);
+        // The survivors are the newest suffix, order preserved.
+        assert_eq!(tids.first().copied(), Some(dropped as u64));
+        assert_eq!(tids.last().copied(), Some(99));
+    }
+
+    #[test]
+    fn capped_seed_refuses_when_nothing_fits() {
+        let ring: VecDeque<Trade> = std::iter::once(test_trade(0, MAX_PAYLOAD_BYTES)).collect();
+        assert!(capped_trades_seed(&ring).is_none());
     }
 }
