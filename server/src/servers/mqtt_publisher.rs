@@ -569,8 +569,19 @@ impl Publisher {
             }
         }
         self.publish_trade_seeds(now);
-        let health = format!("{{\"time\":{}}}", unix_millis());
-        if let Err(err) = self.client.try_publish(HEALTH_TOPIC, QoS::AtMostOnce, true, health.into_bytes()) {
+        // `time` alone only proves this process is alive; a book frozen behind
+        // a stalled node kept beating through an 18-minute outage (2026-09-22).
+        // `blockTime` is the block time of the last published book, so a
+        // consumer can tell stale from live. Absent until the first snapshot
+        // (its seed time is 0 before a block applies).
+        let mut health = serde_json::json!({ "time": unix_millis() });
+        if let Some(InternalMessage::Snapshot { time, .. }) = self.last_snapshot.as_deref()
+            && *time > 0
+        {
+            health["blockTime"] = serde_json::json!(time);
+        }
+        if let Err(err) = self.client.try_publish(HEALTH_TOPIC, QoS::AtMostOnce, true, health.to_string().into_bytes())
+        {
             warn!("MQTT health publish failed: {err}");
         }
     }

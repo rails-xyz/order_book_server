@@ -20,7 +20,7 @@ use std::{
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     io::{Read, Seek, SeekFrom},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -30,12 +30,22 @@ use tokio::{
         broadcast::Sender,
         mpsc::{UnboundedSender, unbounded_channel},
     },
-    time::{Instant, interval_at, sleep},
+    time::{Instant, MissedTickBehavior, interval_at, sleep},
 };
 use utils::{BatchQueue, EventBatch, process_rmp_file, validate_snapshot_consistency};
 
 mod state;
 mod utils;
+
+const STALL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+// Blocks are ~70ms apart, so 15s without one is far outside normal jitter,
+// and short enough that a wedged process is restarted before consumers notice.
+const STALL_TIMEOUT: Duration = Duration::from_secs(15);
+// Once data is arriving without applying, wait one more check before calling
+// the process wedged: the check can land between a block's statuses push and
+// its diffs push right as the node resumes, which looks identical for a moment.
+const SIDECAR_STALL_GRACE: Duration = STALL_CHECK_INTERVAL;
+const STALL_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 // WARNING - this code assumes no other file system operations are occurring in the watched directories
 // if there are scripts running, this may not work as intended
@@ -75,6 +85,9 @@ pub(crate) async fn hl_listen(
     let start = Instant::now() + Duration::from_secs(5);
     let mut ticker = interval_at(start, Duration::from_secs(10));
     let mut last_snapshot_fetch: Option<Instant> = None;
+    let mut stall_check = interval_at(Instant::now() + STALL_CHECK_INTERVAL, STALL_CHECK_INTERVAL);
+    stall_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut stall: Option<StallTracker> = None;
     loop {
         tokio::select! {
             event = fs_event_rx.recv() =>  match event {
@@ -135,13 +148,89 @@ pub(crate) async fn hl_listen(
                     fetch_snapshot(dir.clone(), listener, snapshot_fetch_task_tx, ignore_spot);
                 }
             }
-            () = sleep(Duration::from_secs(5)) => {
-                let listener = listener.lock().await;
-                if listener.is_ready() {
-                    return Err(format!("Stream has fallen behind ({HL_NODE} failed?)").into());
-                }
+            _ = stall_check.tick() => {
+                let progress = listener.lock().await.progress();
+                check_stall(&mut stall, progress, Instant::now())?;
             }
         }
+    }
+}
+
+// Measured on book height, not on fs-event silence: the old `sleep(5s)`
+// watchdog was re-armed by ANY event in the watched trees, so a book frozen
+// while unrelated files were still being written (2026-09-22: a whole hour
+// after midnight) never tripped it, and it could not tell a dead node from a
+// wedged sidecar.
+fn check_stall(stall: &mut Option<StallTracker>, progress: Option<(u64, u64)>, now: Instant) -> Result<()> {
+    let Some((height, blocks_received)) = progress else {
+        *stall = None;
+        return Ok(());
+    };
+    let tracker = stall.get_or_insert_with(|| StallTracker::new(height, blocks_received, now));
+    match tracker.observe(height, blocks_received, now) {
+        Stall::Quiet => Ok(()),
+        // Exiting here would not bring the node back, and each restart makes it
+        // dump ~350MB of L4 state, which is the last thing a struggling node
+        // needs. Serve the last good book and say so loudly for a log-metric alarm.
+        Stall::Node { for_secs } => {
+            error!("{HL_NODE} stall: no block data for {for_secs}s; serving the book frozen at height {height}");
+            Ok(())
+        }
+        Stall::Sidecar { for_secs, blocks } => Err(format!(
+            "Order book stuck at height {height} for {for_secs}s while {blocks} block batches arrived; restarting to resync"
+        )
+        .into()),
+    }
+}
+
+enum Stall {
+    Quiet,
+    Node { for_secs: u64 },
+    Sidecar { for_secs: u64, blocks: u64 },
+}
+
+struct StallTracker {
+    height: u64,
+    blocks_received: u64,
+    since: Instant,
+    data_without_progress_since: Option<Instant>,
+    last_logged: Option<Instant>,
+}
+
+impl StallTracker {
+    const fn new(height: u64, blocks_received: u64, now: Instant) -> Self {
+        Self { height, blocks_received, since: now, data_without_progress_since: None, last_logged: None }
+    }
+
+    // `blocks_received` counts statuses/diffs batches accepted into the caches.
+    // Height frozen while it grows means this process is failing to apply what
+    // the node writes (misaligned attach, one source stuck on an old file) and a
+    // restart heals it; height frozen with nothing arriving is the node's problem
+    // and a restart only costs a snapshot dump.
+    fn observe(&mut self, height: u64, blocks_received: u64, now: Instant) -> Stall {
+        if height != self.height {
+            *self = Self::new(height, blocks_received, now);
+            return Stall::Quiet;
+        }
+        let stalled_for = now.duration_since(self.since);
+        if stalled_for < STALL_TIMEOUT {
+            return Stall::Quiet;
+        }
+        if blocks_received > self.blocks_received {
+            let data_since = *self.data_without_progress_since.get_or_insert(now);
+            if now.duration_since(data_since) >= SIDECAR_STALL_GRACE {
+                return Stall::Sidecar {
+                    for_secs: stalled_for.as_secs(),
+                    blocks: blocks_received - self.blocks_received,
+                };
+            }
+            return Stall::Quiet;
+        }
+        if self.last_logged.is_none_or(|at| now.duration_since(at) >= STALL_LOG_INTERVAL) {
+            self.last_logged = Some(now);
+            return Stall::Node { for_secs: stalled_for.as_secs() };
+        }
+        Stall::Quiet
     }
 }
 
@@ -256,8 +345,15 @@ pub(crate) struct OrderBookListener {
     fill_status_file: Option<File>,
     order_status_file: Option<File>,
     order_diff_file: Option<File>,
+    // Path each file above was opened from; a Modify event on a different path
+    // is the only trace of a Create the watcher never delivered.
+    fill_status_path: Option<PathBuf>,
+    order_status_path: Option<PathBuf>,
+    order_diff_path: Option<PathBuf>,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
+    // Statuses/diffs batches accepted into the caches, for the stall check
+    blocks_received: u64,
     last_fill: Option<u64>,
     // Chronological per coin, capped at RECENT_TRADES_CAP; seeds new trades
     // subscribers so they don't stare at an empty panel until the next trade
@@ -285,7 +381,11 @@ impl OrderBookListener {
             fill_status_file: None,
             order_status_file: None,
             order_diff_file: None,
+            fill_status_path: None,
+            order_status_path: None,
+            order_diff_path: None,
             order_book_state: None,
+            blocks_received: 0,
             last_fill: None,
             recent_trades: HashMap::new(),
             fetched_snapshot_cache: None,
@@ -305,9 +405,18 @@ impl OrderBookListener {
         self.order_book_state.is_some()
     }
 
+    // (height, blocks_received); None while unseeded, when updates only queue
+    // and "no progress" is the expected regime
+    const fn progress(&self) -> Option<(u64, u64)> {
+        match &self.order_book_state {
+            Some(state) => Some((state.height(), self.blocks_received)),
+            None => None,
+        }
+    }
+
     // Forget the book so the next ticker fetch re-seeds via init_from_snapshot;
     // while None, receive_batch queues updates instead of applying them, and the
-    // fallen-behind watchdog is disarmed - the same regime as before first seed.
+    // stall check is disarmed - the same regime as before first seed.
     fn reset_state(&mut self) {
         self.order_book_state = None;
     }
@@ -346,10 +455,14 @@ impl OrderBookListener {
     fn receive_batch(&mut self, updates: EventBatch) -> Result<()> {
         match updates {
             EventBatch::Orders(batch) => {
-                self.order_status_cache.push(batch);
+                if self.order_status_cache.push(batch) {
+                    self.blocks_received += 1;
+                }
             }
             EventBatch::BookDiffs(batch) => {
-                self.order_diff_cache.push(batch);
+                if self.order_diff_cache.push(batch) {
+                    self.blocks_received += 1;
+                }
             }
             EventBatch::Fills(batch) => {
                 // Recording last_fill (upstream never assigned it) makes this
@@ -452,25 +565,79 @@ impl OrderBookListener {
 }
 
 impl OrderBookListener {
-    fn process_update(&mut self, event: &Event, new_path: &PathBuf, event_source: EventSource) -> Result<()> {
-        if event.kind.is_create() {
-            info!("-- Event: {} created --", new_path.display());
-            self.on_file_creation(new_path.clone(), event_source)?;
+    fn tracked_path(&self, event_source: EventSource) -> Option<&Path> {
+        match event_source {
+            EventSource::Fills => self.fill_status_path.as_deref(),
+            EventSource::OrderStatuses => self.order_status_path.as_deref(),
+            EventSource::OrderDiffs => self.order_diff_path.as_deref(),
         }
-        // Check for `Modify` event (only if the file is already initialized)
-        else {
-            // If we are not tracking anything right now, we treat a file update as declaring that it has been created.
-            // Unfortunately, we miss the update that occurs at this time step.
-            // We go to the end of the file to read for updates after that.
-            if self.is_reading(event_source) {
-                self.on_file_modification(event_source)?;
+    }
+
+    fn set_tracked_path(&mut self, event_source: EventSource, path: &Path) {
+        let slot = match event_source {
+            EventSource::Fills => &mut self.fill_status_path,
+            EventSource::OrderStatuses => &mut self.order_status_path,
+            EventSource::OrderDiffs => &mut self.order_diff_path,
+        };
+        *slot = Some(path.to_path_buf());
+    }
+
+    fn process_update(&mut self, event: &Event, new_path: &Path, event_source: EventSource) -> Result<()> {
+        let is_create = event.kind.is_create();
+        if should_switch(is_create, new_path, self.tracked_path(event_source)) {
+            if is_create {
+                info!("-- Event: {} created --", new_path.display());
             } else {
-                info!("-- Event: {} modified, tracking it now --", new_path.display());
-                let file = self.file_mut(event_source);
-                *file = Some(open_tail_at_line_boundary(new_path)?);
+                // The watcher adds a watch for a new day directory only after
+                // its Create event is delivered, so files hl-node writes into it
+                // in the meantime (the `0` hour file at 00:00) never produce a
+                // Create. Their Modify events used to be read from the OLD
+                // file's descriptor (at EOF, forever), freezing the book until
+                // the `1` file at 01:00 arrived 50k blocks ahead and killed the
+                // process (2026-09-17..22, daily).
+                info!("-- Event: {} modified but not tracked (missed create); switching to it --", new_path.display());
             }
+            self.on_file_creation(new_path.to_path_buf(), event_source)?;
+            self.set_tracked_path(event_source, new_path);
+        } else if self.is_reading(event_source) {
+            // Writes to an older hour's file (an export or a repair touching it)
+            // are not ours to read; only the tracked file carries new blocks.
+            if self.tracked_path(event_source) == Some(new_path) {
+                self.on_file_modification(event_source)?;
+            }
+        } else {
+            // Nothing tracked yet: the file predates this process, so attach at
+            // its tail rather than replay an hour of history.
+            info!("-- Event: {} modified, tracking it now --", new_path.display());
+            *self.file_mut(event_source) = Some(open_tail_at_line_boundary(new_path)?);
+            self.set_tracked_path(event_source, new_path);
         }
         Ok(())
+    }
+}
+
+// hl-node lays files out as `hourly/YYYYMMDD/H`; None for anything else so an
+// unfamiliar layout falls back to create-only switching instead of guessing.
+fn hourly_key(path: &Path) -> Option<(u32, u32)> {
+    let hour = path.file_name()?.to_str()?.parse().ok()?;
+    let day_dir = path.parent()?;
+    let date = day_dir.file_name()?.to_str()?.parse().ok()?;
+    (day_dir.parent()?.file_name()? == "hourly").then_some((date, hour))
+}
+
+// Whether `candidate` should replace `tracked` as the file being read. Only a
+// strictly newer (date, hour) qualifies: a touch on an older file must not send
+// the reader back through gigabytes of already-applied history.
+fn should_switch(is_create: bool, candidate: &Path, tracked: Option<&Path>) -> bool {
+    let Some(tracked) = tracked else {
+        return is_create;
+    };
+    if candidate == tracked {
+        return false;
+    }
+    match (hourly_key(candidate), hourly_key(tracked)) {
+        (Some(candidate), Some(tracked)) => candidate > tracked,
+        _ => is_create,
     }
 }
 
@@ -480,7 +647,7 @@ impl OrderBookListener {
 // stalled OrderStatuses — and the book — until a restart). Position at the
 // start of the trailing partial line instead; its batch is then processed
 // once the writer finishes it.
-fn open_tail_at_line_boundary(path: &PathBuf) -> Result<File> {
+fn open_tail_at_line_boundary(path: &Path) -> Result<File> {
     let mut file = File::open(path)?;
     let mut pos = file.seek(SeekFrom::End(0))?;
     let mut buf = vec![0_u8; 64 * 1024];
@@ -662,5 +829,90 @@ mod tests {
         contents.write_all(b"{\"a\":1}\n").unwrap();
         contents.extend(std::iter::repeat_n(b'x', 100 * 1024));
         assert_eq!(tail_offset("long_partial", &contents), 8);
+    }
+
+    fn hourly(date: &str, hour: &str) -> PathBuf {
+        PathBuf::from("/home/hl/hl/data/node_raw_book_diffs_by_block/hourly").join(date).join(hour)
+    }
+
+    #[test]
+    fn hourly_key_parses_node_layout_only() {
+        assert_eq!(hourly_key(&hourly("20260922", "0")), Some((20_260_922, 0)));
+        assert_eq!(hourly_key(&hourly("20260922", "23")), Some((20_260_922, 23)));
+        assert_eq!(hourly_key(Path::new("/home/hl/hl/data/node_raw_book_diffs_by_block/20260922/0")), None);
+        assert_eq!(hourly_key(&hourly("20260922", "0.tmp")), None);
+        assert_eq!(hourly_key(&hourly("today", "0")), None);
+    }
+
+    #[test]
+    fn switch_follows_only_newer_hourly_files() {
+        let h23 = hourly("20260921", "23");
+        let h0 = hourly("20260922", "0");
+        let h1 = hourly("20260922", "1");
+        // Nothing tracked: a create adopts the file, a modify attaches at its tail instead.
+        assert!(should_switch(true, &h23, None));
+        assert!(!should_switch(false, &h23, None));
+        // Same file: a plain modification.
+        assert!(!should_switch(false, &h23, Some(&h23)));
+        assert!(!should_switch(true, &h23, Some(&h23)));
+        // Hour rollover within a day, and the midnight case where `0` is only ever seen modified.
+        assert!(should_switch(true, &h1, Some(&h0)));
+        assert!(should_switch(false, &h0, Some(&h23)));
+        // Older files are never re-read, whatever event they produce.
+        assert!(!should_switch(false, &h23, Some(&h0)));
+        assert!(!should_switch(true, &h23, Some(&h0)));
+        // Unfamiliar layout: the pre-existing create-only behavior.
+        let odd = PathBuf::from("/somewhere/else/file");
+        assert!(should_switch(true, &odd, Some(&h0)));
+        assert!(!should_switch(false, &odd, Some(&h0)));
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[test]
+    fn stall_tracker_stays_quiet_while_height_advances() {
+        let t0 = Instant::now();
+        let mut tracker = StallTracker::new(100, 10, t0);
+        for i in 1..10 {
+            assert!(matches!(tracker.observe(100 + i, 10 + 2 * i, t0 + secs(5 * i)), Stall::Quiet));
+        }
+    }
+
+    #[test]
+    fn stall_tracker_reports_node_stall_without_data_and_rate_limits_it() {
+        let t0 = Instant::now();
+        let mut tracker = StallTracker::new(100, 10, t0);
+        assert!(matches!(tracker.observe(100, 10, t0 + secs(5)), Stall::Quiet));
+        assert!(matches!(tracker.observe(100, 10, t0 + secs(10)), Stall::Quiet));
+        assert!(matches!(tracker.observe(100, 10, t0 + secs(15)), Stall::Node { for_secs: 15 }));
+        assert!(matches!(tracker.observe(100, 10, t0 + secs(20)), Stall::Quiet));
+        assert!(matches!(tracker.observe(100, 10, t0 + secs(70)), Stall::Quiet));
+        assert!(matches!(tracker.observe(100, 10, t0 + secs(75)), Stall::Node { for_secs: 75 }));
+        // The node comes back: one advanced height resets everything.
+        assert!(matches!(tracker.observe(101, 12, t0 + secs(80)), Stall::Quiet));
+        assert!(matches!(tracker.observe(101, 12, t0 + secs(90)), Stall::Quiet));
+        assert!(matches!(tracker.observe(101, 12, t0 + secs(95)), Stall::Node { for_secs: 15 }));
+    }
+
+    #[test]
+    fn stall_tracker_reports_sidecar_stall_when_data_arrives_but_never_applies() {
+        let t0 = Instant::now();
+        let mut tracker = StallTracker::new(100, 10, t0);
+        assert!(matches!(tracker.observe(100, 10, t0 + secs(10)), Stall::Quiet));
+        // Data flowing at the first stalled check gets one grace check.
+        assert!(matches!(tracker.observe(100, 50, t0 + secs(15)), Stall::Quiet));
+        assert!(matches!(tracker.observe(100, 90, t0 + secs(20)), Stall::Sidecar { for_secs: 20, blocks: 80 }));
+    }
+
+    #[test]
+    fn stall_tracker_forgives_data_that_applies_within_the_grace_check() {
+        let t0 = Instant::now();
+        let mut tracker = StallTracker::new(100, 10, t0);
+        assert!(matches!(tracker.observe(100, 10, t0 + secs(15)), Stall::Node { .. }));
+        // Node resumes; the check lands between a block's two pushes.
+        assert!(matches!(tracker.observe(100, 11, t0 + secs(20)), Stall::Quiet));
+        assert!(matches!(tracker.observe(170, 150, t0 + secs(25)), Stall::Quiet));
     }
 }

@@ -94,3 +94,31 @@ and starts at the trailing partial line, which parses once the writer completes 
 misaligned attach) was rewound to and retried forever. After: only the chunk's last
 line — the only one a torn read can explain — is rewound; a bad line with data after
 it is dropped, and snapshot validation resyncs any drift.
+
+## (2026-09-22) — Follow files whose Create was missed; stall check on book height
+
+**Bug (upstream).** notify adds the inotify watch for a new `hourly/YYYYMMDD/` directory
+only after delivering its Create event, so the `0` file hl-node writes into it at 00:00
+produces no Create of its own. Its Modify events were then read from the previous day's
+`23` descriptor (at EOF), so fills and diffs froze while statuses kept flowing — and the
+`sleep(5s)` watchdog, re-armed by any event, never fired. At 01:00 the `1` Create was
+seen, the reader jumped ~50k blocks, and `Expecting block N, got block N+50k` killed the
+process. Before: a frozen book from 00:00 to 01:00 UTC every day (2026-09-17..22), then a
+restart. After: the tracked path is remembered per source; a Modify on an untracked path
+switches to it (read from offset 0) if its `(date, hour)` is strictly newer than the
+tracked file, so a touch on an older file never replays history.
+
+**Bug (upstream).** The fallen-behind watchdog measured fs-event silence, not progress,
+and treated every stall as fatal. During a 17-minute hl-node stall (2026-09-22 13:51–
+14:07, peer feeding old blocks) it did not fire at all; had it fired, each restart would
+have cost the struggling node a ~350MB L4 state dump for nothing. After: an independent
+5s check on book height. Height frozen ≥15s with statuses/diffs batches still arriving
+(the process is wedged; a restart heals) → fatal exit. Height frozen with nothing
+arriving (the node's problem) → keep serving the last book and log
+`hl-node stall: no block data for Ns; serving the book frozen at height H` every 60s,
+for a log-metric alarm.
+
+**Feature.** The retained `order-book-stream/health` frame carries `blockTime` (block
+time in ms of the last published book) alongside `time`. Before: `time` only proved the
+process was alive, and kept beating through the 18-minute-stale book above. After:
+consumers can tell stale from live. Additive field; absent until the first book is seeded.
